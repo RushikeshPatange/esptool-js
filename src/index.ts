@@ -13,6 +13,7 @@ export { Transport, SerialOptions } from "./webserial.js";
 export { decodeBase64Data, getStubJsonByChipName, Stub } from "./stubFlasher.js";
 export { LoaderOptions } from "./types/loaderOptions.js";
 export { FlashOptions } from "./types/flashOptions.js";
+export { VerifyFlashOptions, VerifyResult, VerifyProgressCallback } from "./types/verifyOptions.js";
 export { IEspLoaderTerminal } from "./types/loaderTerminal.js";
 export { Before, After } from "./types/resetModes.js";
 export { FlashModeValues, FlashSizeValues, FlashFreqValues } from "./types/arguments.js";

@@ -8,6 +8,7 @@ import { padTo } from "./util.js";
 import { IEspLoaderTerminal } from "./types/loaderTerminal.js";
 import { LoaderOptions } from "./types/loaderOptions.js";
 import { FlashOptions } from "./types/flashOptions.js";
+import { VerifyFlashOptions, VerifyResult } from "./types/verifyOptions.js";
 import { After, Before } from "./types/resetModes.js";
 import { FlashFreqValues, FlashModeValues, FlashSizeValues } from "./types/arguments.js";
 import { loadFirmwareImage } from "./image/index.js";
@@ -1592,6 +1593,167 @@ export class ESPLoader {
         await this.flashFinish();
       }
     }
+  }
+
+  /**
+   * Verify the contents of the SPI flash memory against the provided binary files or byte data.
+   *
+   * This method compares the data in flash memory with the provided binary data by first
+   * comparing MD5 checksums. If checksums don't match and diff option is enabled, it performs
+   * a byte-by-byte comparison to show the differences.
+   *
+   * Note: Web Crypto API does not support MD5, so you must provide a calculateMD5Hash function.
+   * You can use libraries like 'js-md5', 'spark-md5', or 'crypto-js' for this purpose.
+   *
+   * @param {VerifyFlashOptions} options - Options for verification including file data and settings.
+   * @returns {Promise<VerifyResult[]>} Array of verification results for each file.
+   * @throws {ESPError} If verification fails or calculateMD5Hash is not provided.
+   *
+   * @example
+   * ```typescript
+   * import md5 from 'js-md5';  // or any MD5 library
+   *
+   * const results = await loader.verifyFlash({
+   *   fileArray: [
+   *     { data: binaryData1, address: 0x1000 },
+   *     { data: binaryData2, address: 0x10000 }
+   *   ],
+   *   calculateMD5Hash: (image) => md5(image),  // Required: MD5 hash function
+   *   diff: true  // Show byte differences on failure
+   * });
+   *
+   * if (results.every(r => r.success)) {
+   *   console.log("Verification successful!");
+   * }
+   * ```
+   */
+  async verifyFlash(options: VerifyFlashOptions): Promise<VerifyResult[]> {
+    this.debug("verifyFlash");
+
+    // Validate that calculateMD5Hash is provided
+    // Web Crypto API (SubtleCrypto) does not support MD5, only SHA algorithms
+    if (!options.calculateMD5Hash) {
+      throw new ESPError(
+        "calculateMD5Hash function is required for verifyFlash. " +
+          "Web Crypto API does not support MD5. " +
+          "Please provide an MD5 implementation (e.g., from 'js-md5', 'spark-md5', or 'crypto-js').",
+      );
+    }
+
+    const results: VerifyResult[] = [];
+    let mismatch = false;
+
+    for (let i = 0; i < options.fileArray.length; i++) {
+      const file = options.fileArray[i];
+      let image = file.data;
+      const address = file.address;
+
+      if (image.length === 0) {
+        this.debug("Warning: File is empty, skipping verification");
+        continue;
+      }
+
+      // Pad to 4-byte alignment (same as Python version)
+      image = this.ui8ToBstr(padTo(this.bstrToUi8(image), 4));
+
+      // Update image flash parameters if this is a bootloader image
+      // This ensures we compare against what would actually be written
+      image = await this._updateImageFlashParams(
+        image,
+        address,
+        options.flashMode || "keep",
+        options.flashFreq || "keep",
+      );
+
+      const imageSize = image.length;
+      this.info(
+        `Verifying 0x${imageSize.toString(16)} (${imageSize}) bytes @ 0x${address.toString(16).padStart(8, "0")}...`,
+      );
+
+      // Report progress if callback provided
+      if (options.reportProgress) {
+        options.reportProgress(i, 0, imageSize);
+      }
+
+      // Get MD5 from flash
+      const flashDigest = await this.flashMd5sum(address, imageSize);
+
+      // Calculate expected MD5 using the provided hash function
+      const expectedDigest = options.calculateMD5Hash(image);
+
+      const result: VerifyResult = {
+        address,
+        success: false,
+        expectedMd5: expectedDigest,
+        flashMd5: flashDigest,
+      };
+
+      if (flashDigest === expectedDigest) {
+        this.info("Verification successful (digest matched).");
+        result.success = true;
+        results.push(result);
+
+        if (options.reportProgress) {
+          options.reportProgress(i, imageSize, imageSize);
+        }
+        continue;
+      }
+
+      // Digest mismatch
+      mismatch = true;
+
+      if (!options.diff) {
+        this.info("Verification failed (digest mismatch).");
+        this.info(`  Expected: ${expectedDigest}`);
+        this.info(`  Flash:    ${flashDigest}`);
+        results.push(result);
+        continue;
+      }
+
+      // Perform byte-by-byte comparison
+      this.info("Verification failed, reading flash for detailed comparison...");
+      const flashData = await this.readFlash(address, imageSize, (packet, progress, total) => {
+        if (options.reportProgress) {
+          options.reportProgress(i, progress, total);
+        }
+      });
+
+      const imageBytes = this.bstrToUi8(image);
+      const differences: Array<[number, number, number]> = [];
+
+      for (let j = 0; j < imageSize; j++) {
+        if (flashData[j] !== imageBytes[j]) {
+          differences.push([address + j, flashData[j], imageBytes[j]]);
+        }
+      }
+
+      result.differenceCount = differences.length;
+      result.differences = differences;
+
+      this.info(`Verification failed: ${differences.length} differences, first @ 0x${differences[0][0].toString(16)}:`);
+
+      // Show first few differences (limit output to avoid flooding)
+      const maxDiffsToShow = Math.min(differences.length, 16);
+      for (let j = 0; j < maxDiffsToShow; j++) {
+        const [addr, flashByte, imageByte] = differences[j];
+        this.info(
+          `  0x${addr.toString(16).padStart(8, "0")}: flash=${flashByte
+            .toString(16)
+            .padStart(2, "0")} expected=${imageByte.toString(16).padStart(2, "0")}`,
+        );
+      }
+      if (differences.length > maxDiffsToShow) {
+        this.info(`  ... and ${differences.length - maxDiffsToShow} more differences`);
+      }
+
+      results.push(result);
+    }
+
+    if (mismatch) {
+      throw new ESPError("Verification failed.");
+    }
+
+    return results;
   }
 
   /**
